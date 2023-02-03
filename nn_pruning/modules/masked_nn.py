@@ -19,10 +19,12 @@ the weight matrix to prune a portion of the weights.
 The pruned weight matrix is then multiplied against the inputs (and if necessary, the bias is added).
 """
 
+from argparse import ArgumentError
 import math
 from dataclasses import dataclass
 from itertools import permutations
 from typing import List, Optional
+from transformers.modeling_utils import Conv1D 
 
 import torch
 from torch import nn
@@ -39,7 +41,7 @@ from nn_pruning.training_patcher import (
     ReplacementModule,
 )
 
-from .binarizer import MagnitudeBinarizer, ThresholdBinarizer, TopKBinarizer
+from .binarizer import MagnitudeBinarizer, ThresholdBinarizer, TopKBinarizer,  SageBinarizer, GlobalTopKBinarizer, GroupMagnitudeBinarizer
 import numpy
 
 sparse_patterns = None
@@ -70,6 +72,15 @@ class InitDirective:
 class LinearPruningArgs(RuntimeLinearPruningArgs):
     mask_init: InitDirective = InitDirective()
     ampere_init: InitDirective = InitDirective()
+    sage_beta_meta: float = 0
+    uniqueness_tau: float = 0
+    soft_temperature: float = 0
+    adjust_grad_lamb: float = 0
+    mask_span_reg_lamb: float = 0
+    scale_pruned: bool = False
+    scale_fc: bool = False
+    scale_proj: bool = False
+    mask_frozen: bool = False
 
 
 class GenericLinearPruningContextModule(PatcherContextModule):
@@ -86,14 +97,30 @@ class GenericLinearPruningContextModule(PatcherContextModule):
             init.constant_(mask_scores, val=mask_scale)
         elif mask_init == "uniform":
             init.uniform_(mask_scores, a=-mask_scale, b=mask_scale)
+            print("using uniform random mask scores with scale", mask_scale)
         elif mask_init == "kaiming":
             init.kaiming_uniform_(mask_scores, a=math.sqrt(5))
 
+        if self.args.mask_frozen:
+            mask_scores.requires_grad = False
+            print("mask scores are frozen - no grad")
+
     def regularization(self, method):
         mask_scores = self.mask_scores
+
         numel = mask_scores.numel()
         if method == "l1":
-            module_regu = torch.norm(torch.sigmoid(mask_scores), p=1) / numel
+            if hasattr(self, "regu_mask_mult"):
+                module_regu = torch.norm(torch.sigmoid(mask_scores)* self.regu_mask_mult, p=1) / numel
+            elif hasattr(self, "threshold"):
+                # module_regu = torch.norm(torch.sigmoid((mask_scores - self.threshold) / self.args.soft_temperature), p=1) / numel
+                # module_regu = torch.sigmoid((mask_scores - self.threshold) / self.args.soft_temperature).sum() / numel
+                
+                module_regu = torch.relu((mask_scores - self.threshold) ).mean()
+                # 0/0
+                # module_regu = torch.norm(torch.sigmoid(mask_scores), p=1) / numel
+            else:
+                module_regu = torch.norm(torch.sigmoid(mask_scores), p=1) / numel
         elif method == "l0":
             module_regu = torch.sigmoid(mask_scores - 2 / 3 * numpy.log(0.1 / 1.1)).sum() / numel
         else:
@@ -122,6 +149,18 @@ class BlockLinearPruningContextModule(LinearPruningContextModule):
         self.mask_scores = nn.Parameter(torch.Tensor(size=self.mask_size))
         self.init_masks(self.args.mask_init)
 
+class SageLinearPruningContextModule(LinearPruningContextModule):
+    def __init__(self, shape, args: LinearPruningArgs):
+        super().__init__(shape, args)
+        assert args.method == "sage"
+        assert args.submethod == "default"
+        self.mask_scores = nn.Parameter(torch.Tensor(size=self.mask_size))    # will need to exclude this from opt, don't use this at all
+        # self.register_buffer('mask_scores', torch.Tensor(size=self.mask_size))
+        self.register_buffer('ipt', torch.Tensor(size=self.mask_size))
+        self.register_buffer('exp_avg_unc', torch.Tensor(size=self.mask_size))
+        self.register_buffer('exp_avg_ipt', torch.Tensor(size=self.mask_size))
+        self.init_masks(self.args.mask_init)
+
 
 class SingleDimensionLinearPruningContextModule(LinearPruningContextModule):
     def __init__(self, shape, is_row, args: LinearPruningArgs):
@@ -132,6 +171,20 @@ class SingleDimensionLinearPruningContextModule(LinearPruningContextModule):
 
         self.mask_scores = nn.Parameter(torch.zeros(size=size))
         self.init_masks(self.args.mask_init)
+        
+        if self.args.adjust_grad_lamb != 0 or args.mask_span_reg_lamb != 0: # really should rename this now
+            self.register_buffer('regu_mask_mult', torch.ones(size=size, requires_grad=False))
+
+        if args.method == "uniqueness":
+            print("Not optimizing mask scores, using uniqueness", "is row", is_row, size)
+            self.mask_scores.requires_grad = False
+
+        if args.soft_temperature > 0:
+            self.threshold = nn.Parameter(self.mask_scores.new_zeros((1,)))
+            # init.constant_(self.threshold, val=-1)
+            init.constant_(self.threshold, val=0)
+
+
 
 
 class AmpereLinearPruningContextModule(GenericLinearPruningContextModule):
@@ -252,7 +305,6 @@ class AmpereMaskModule(nn.Module):
         else:
             raise Exception(f"Unknown ampere method {self.method}")
 
-
 class MaskModule(nn.Module):
     def __init__(
         self,
@@ -263,6 +315,11 @@ class MaskModule(nn.Module):
         assert isinstance(context_modules, (list, tuple))
         self.context_modules = nn.ModuleList(context_modules)
         self.args = args
+
+        if self.args.method == "sage":
+            # only 1 module for sagepruning, structured not implemented yet
+            # gets complicated passing the buffers into mask function if using multiple sage contexts
+            assert len(context_modules) == 1 
 
     @staticmethod
     def expand_mask(mask, block_rows, block_cols):
@@ -277,6 +334,10 @@ class MaskModule(nn.Module):
         args: LinearPruningArgs,
         threshold: float,
         training,
+        input,
+        ipt=None,
+        exp_avg_unc=None,
+        exp_avg_ipt=None
     ):
         method = args.method
         if method == "disabled":
@@ -285,22 +346,49 @@ class MaskModule(nn.Module):
         submethod = args.submethod
         if submethod.startswith("1d"):
             dividers = args.block_rows, args.block_cols
+            no_matmul = False
             for i, m in enumerate(mask_scores):
                 if m is None:
-                    assert submethod == "1d_alt"
+                    # assert submethod == "alt"
+                    assert "1d_alt" in submethod or "1d_only" in submethod
                     mask_scores[i] = torch.ones(weight.shape[i] // dividers[i], device=weight.device)
 
-            mask_scores = mask_scores[0].unsqueeze(-1).matmul(mask_scores[1].unsqueeze(0))
-        else:
+            if not no_matmul:
+                mask_scores = mask_scores[0].unsqueeze(-1).matmul(mask_scores[1].unsqueeze(0))
+            else:
+                # mask_scores = mask_scores[0].unsqueeze(-1)
+                mask_scores = mask_scores[0]
+        elif method not in "magnitude":
             mask_scores = mask_scores[0]
 
         if method == "topK":
             mask = TopKBinarizer.apply(mask_scores, threshold)
         elif method == "magnitude":
             mask = MagnitudeBinarizer.apply(weight, threshold)
+        elif method == "group_magnitude":
+            mask = GroupMagnitudeBinarizer.apply(weight, threshold)
         elif method in ["threshold", "sigmoied_threshold"]:
             sig = "sigmoied" in method
+            # print(threshold)
             mask = ThresholdBinarizer.apply(mask_scores, threshold, sig, args.min_elements)
+        elif method in ["global_topK"]:
+            mask = GlobalTopKBinarizer.apply(mask_scores, threshold, args.min_elements)
+        elif method == "extra_soft":
+            # print(threshold)
+            # mask = (mask_scores - threshold) / args.soft_temperature
+            # print(mask_scores.flatten()[:10])
+
+            # mask = torch.sigmoid((mask_scores - threshold) / args.soft_temperature)
+            mask = (mask_scores - threshold) / args.soft_temperature
+            # print(mask_scores)
+            # print(threshold)
+
+
+            mask =  ThresholdBinarizer.apply(mask, 0, False, 0)
+            # mask = mask * ThresholdBinarizer.apply(mask, .05, False, 0)
+            # mask = ThresholdBinarizer.apply(mask, .1, False, 0)
+            
+            # mask = torch.sigmoid((torch.log(mask_scores) - threshold) / args.soft_temperature)
         elif method == "l0":
             l, r, b = -0.1, 1.1, 2 / 3
             if training:
@@ -310,6 +398,11 @@ class MaskModule(nn.Module):
                 s = torch.sigmoid(mask_scores)
             s_bar = s * (r - l) + l
             mask = s_bar.clamp(min=0.0, max=1.0)
+        elif method == "sage":
+            assert exp_avg_unc != None
+            assert exp_avg_ipt != None
+
+            mask = SageBinarizer.apply(ipt, exp_avg_unc, exp_avg_ipt, threshold, args.sage_beta_meta)
         else:
             raise NotImplementedError(f"Unknown method {method}")
 
@@ -323,13 +416,28 @@ class MaskModule(nn.Module):
 
         return mask
 
-    def forward(self, weight, threshold):
+    def forward(self, weight, threshold, input):
         mask_scores = None
         if self.args.method != "magnitude":
             mask_scores = [(c.mask_scores if c is not None else None) for c in self.context_modules]
 
-        return self.mask(weight, mask_scores, self.args, threshold, self.training)
+        
+        if self.args.soft_temperature > 0:
+            for c in self.context_modules:
+                if c is not None:
+                    threshold = c.threshold
 
+        ipt = None
+        exp_avg_unc = None
+        exp_avg_ipt = None
+        if self.args.method == "sage":
+            # this is ugly, should not be done this way. Should refactor in the future
+            sage_context = self.context_modules[0]
+            ipt = sage_context.ipt
+            exp_avg_unc = sage_context.exp_avg_unc
+            exp_avg_ipt = sage_context.exp_avg_ipt  
+
+        return self.mask(weight, mask_scores, self.args, threshold, self.training, input, ipt=ipt, exp_avg_unc=exp_avg_unc, exp_avg_ipt=exp_avg_ipt)
 
 class MaskedLinear(ReplacementModule):
     def __init__(
@@ -343,8 +451,8 @@ class MaskedLinear(ReplacementModule):
     ):
         super().__init__()
 
-        assert isinstance(linear_module, nn.Linear)
-        self.weight = linear_module.weight
+        assert isinstance(linear_module, nn.Linear) or isinstance(linear_module, Conv1D)
+        self.weight = linear_module.weight if isinstance(linear_module, nn.Linear) else nn.Parameter(linear_module.weight.T.detach().clone())
         self.bias = linear_module.bias
 
         self.mask_module = MaskModule(mask_context_modules, args)
@@ -361,12 +469,42 @@ class MaskedLinear(ReplacementModule):
 
         self.col_additive_mask = col_additive_mask
 
-    def nnz(self, m):
-        return int((m != 0).sum().item())
+        if self.args.method == "global_topK":
+            self.register_buffer('global_topK_threshold', self.weight.new_zeros((1, )))
+            # self.global_topK_threshold = 1
 
-    def get_masked_weights_bias(self):
-        threshold = self.get_context_data("threshold")
-        mask = self.mask_module(self.weight, threshold)
+        self.is_scaling = False
+        
+        if self.args.scale_fc and self.weight.shape[1] < self.weight.shape[0]:  # this is fc because input < output
+            print("using scale fc")
+            self.is_scaling = True
+            self.out_scale = nn.Parameter(self.weight.new_ones((self.weight.shape[0],)))
+
+        if self.args.scale_proj and self.weight.shape[0] < self.weight.shape[1]:  # this is proj because output < input
+            print("using scale proj")
+            self.is_scaling = True
+            self.out_scale = nn.Parameter(self.weight.new_ones((self.weight.shape[0],)))
+
+
+    def nnz(self, m):
+        if len(m.shape) == 1:
+            return int((m != 0).sum().item()*self.weight.shape[1])
+        else:
+            return int((m != 0).sum().item())
+
+    def get_masked_weights_bias(self, input=None):
+        # if self.args.soft_temperature > 0:
+        #     threshold = self.threshold
+        # else:
+
+        if self.args.method == "global_topK":
+            threshold = self.global_topK_threshold
+        else:
+            threshold = self.get_context_data("threshold")
+
+        weights = self.weight
+
+        mask = self.mask_module(weights, threshold, input)
 
         if mask is not None:
             if self.row_additive_mask is not None:
@@ -382,7 +520,7 @@ class MaskedLinear(ReplacementModule):
         if mask is not None:
             self.mask_nnz = self.nnz(mask)
         else:
-            self.mask_nnz = self.weight.numel()
+            self.mask_nnz = weights.numel()
 
         if self.args.ampere_method != "disabled":
             ampere_temperature = self.get_context_data("ampere_temperature")
@@ -396,25 +534,56 @@ class MaskedLinear(ReplacementModule):
                 mask = ampere_mask
             self.base_mask_nnz = self.mask_nnz
             self.mask_nnz = self.nnz(mask)
-
+        
         if mask is not None:
-            masked_weights = mask * self.weight
+            masked_weights = mask * weights
         else:
-            masked_weights = self.weight
+            masked_weights = weights
 
         bias = self.bias
         if bias is not None:
             if self.args.bias_mask and mask is not None:
                 bias = bias * (mask != 0).any(1)
 
-        return masked_weights, bias
+
+        if self.is_scaling:
+            masked_weights = masked_weights * self.out_scale.view((-1, 1))
+            bias = bias * self.out_scale
+
+        return masked_weights, bias, threshold, mask
 
     def forward(self, input):
-        masked_weights, bias = self.get_masked_weights_bias()
+        # masked_weights, bias = self.get_masked_weights_bias(input)
         # Compute output (linear layer) with masked weights
-        return F.linear(input, masked_weights, bias)
+        # return F.linear(input, masked_weights, bias)
+        
+        masked_weights, bias, threshold, mask = self.get_masked_weights_bias(input)
+
+        if self.args.scale_pruned and masked_weights.shape[0] < masked_weights.shape[1]: # so this should be c_proj only?
+            # print (masked_weights.shape[1] , inputs_leftover)
+            # output *= (masked_weights.shape[1] / inputs_leftover)
+            # print (threshold , self.mask_nnz / self.weight.numel())
+            # masked_weights *= threshold**-.5
+
+            # masked_weights *= (self.mask_nnz / self.weight.numel())**-.5
+
+            masked_weights = masked_weights / threshold
+
+
+        output = F.linear(input, masked_weights, bias)
+
+
+        # inputs_leftover = mask.sum(axis=1)[0].detach()
+
+        # if self.is_scaling:
+        #     output = output * self.out_scale
+
+        # return output, gated, mask
+        return output
+
 
     def get_sparsity_info(self):
+        masked_weights, bias, threshold, mask = self.get_masked_weights_bias()   # need this to set mask_nnz... gross
         ret = {"numel": self.weight.numel(), "nnz": self.mask_nnz}
 
         if self.args.ampere_method != "disabled":
@@ -422,7 +591,7 @@ class MaskedLinear(ReplacementModule):
         return ret
 
     def compile(self):
-        masked_weights, bias = self.get_masked_weights_bias()
+        masked_weights, bias, threshold, mask  = self.get_masked_weights_bias()
 
         ret = nn.Linear(self.weight.shape[1], self.weight.shape[0], bias=self.bias is not None)
         with torch.no_grad():
@@ -430,7 +599,6 @@ class MaskedLinear(ReplacementModule):
             if ret.bias is not None:
                 ret.bias.copy_(bias)
         return ret
-
 
 class LinearPruningModulePatcher(ModulePatcher):
     def __init__(
@@ -456,11 +624,11 @@ class LinearPruningModulePatcher(ModulePatcher):
         method = args.method
         submethod = args.submethod
         ampere_method = args.ampere_method
-        PRUNING_METHODS = ["disabled", "topK", "threshold", "sigmoied_threshold", "magnitude", "l0"]
+        PRUNING_METHODS = ["disabled", "topK", "threshold", "sigmoied_threshold", "magnitude", "l0",  "sage", "extra_soft", "global_topK", "group_magnitude"]
         if method not in PRUNING_METHODS:
             raise RuntimeError(f"Unknown pruning method '{method}', should be in {PRUNING_METHODS}")
 
-        PRUNING_SUB_METHODS = ["default", "1d", "1d_alt", "joint"]
+        PRUNING_SUB_METHODS = ["default", "1d", "1d_alt","1d_alt_plus","1d_only", "joint"]
         if submethod not in PRUNING_SUB_METHODS:
             raise RuntimeError(f"Unknown pruning sub method '{submethod}', should be in {PRUNING_SUB_METHODS}")
 
@@ -469,11 +637,13 @@ class LinearPruningModulePatcher(ModulePatcher):
             raise RuntimeError(f"Unknown ampere pruning method '{ampere_method}', should be in {AMPERE_METHODS}")
 
     def create_context_module(self, child_module_name, child_module, key, row=None):
-        shape = child_module.weight.shape
+        shape = child_module.weight.shape if isinstance(child_module, nn.Linear) else child_module.weight.T.shape
         args = self.args
         prefix = key[0]
         if prefix == "mask":
             assert args.submethod in ["default", "joint"]
+            if args.method == "sage":
+                return SageLinearPruningContextModule(shape, args)
             return BlockLinearPruningContextModule(shape, args)
         elif prefix == "mask_1d":
             assert args.submethod.startswith("1d")
@@ -489,7 +659,7 @@ class LinearPruningModulePatcher(ModulePatcher):
             if self.args.submethod.startswith("1d"):
                 mask_row = self.get_context_module(child_module_name, child_module, kind="mask_row", row=True)
                 mask_col = self.get_context_module(child_module_name, child_module, kind="mask_col", row=False)
-                shape = child_module.weight.shape
+                shape = child_module.weight.shape  if isinstance(child_module, nn.Linear) else child_module.weight.T.shape
                 if mask_row is not None:
                     assert mask_row.mask_scores.shape[0] == shape[0] // self.args.block_rows
                 if mask_col is not None:
@@ -559,12 +729,43 @@ class ChannelPruningModulePatcher(LinearPruningModulePatcher):
 
             offset = 1 if kind == "mask_row" else 0  # The weight matrix has a shape [output, input]
 
-            position, name = self.model_structure.get_module_intra_layer_position(child_module_name)
+            # position, name = self.model_structure.get_module_intra_layer_position(child_module_name)
+            '''
+            I have no clue how this is supposed to work. c_fc has an even position and c_proj hAs an odd one?
+            this is so unsafe and doesn't work for gpt2
+            because this depends on attention heads being their own matrices, so they can be in layer patterns, which gpt2 doesn't do
+            so, the positions are messed up for gpt2 and both cproj and cfc get masks...
+            For now, just hardcode the below ifs
+            '''
+            if "c_fc" in child_module_name:
+                position = 0
+            elif "c_proj"  in child_module_name:
+                position = 1
+            else:
+                position, name = self.model_structure.get_module_intra_layer_position(child_module_name)
+
+
+
 
             if self.args.submethod == "1d_alt":
                 if (position % 2) == 1:
                     if kind == "mask_row":
                         return None
+                else:
+                    if kind == "mask_col":
+                        return None
+
+            if self.args.submethod == "1d_alt_plus": # only don't prune inputs for d -> 4d
+                if (position % 2) == 0:
+                    if kind == "mask_col":
+                        return None
+
+            if self.args.submethod == "1d_only": # prune only d dimension row=output, col=input, position 1 = output
+                if (position % 2) == 0:
+                    # if kind == "mask_row":  # DONT mask position 0 output, position 1 input
+                    #     return None
+
+                    return None  # for now, don't mask anything for position 0 (try inputs pruning later)
                 else:
                     if kind == "mask_col":
                         return None

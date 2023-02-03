@@ -36,6 +36,7 @@ from .modules.masked_nn import (
     MaskedLinearModelCompiler,
     GenericLinearPruningContextModule,
     head_mask,
+    InitDirective
 )
 from .modules.nonorm import Layer2NoNorm, NoNorm, NoNormCompiler, Layer2NoNormPatcher
 from .modules.gelu2relu import GeLU2ReLUModelPatcher
@@ -56,8 +57,125 @@ class SparseTrainingArguments:
     Sparse training specific arguments
     """
 
+    soft_temperature: float = field(
+        default=1e-3, metadata={"help": "soft_temperature."}
+    )
+
+    span_reg_lamb: float = field(
+        default=0, metadata={"help": "span_reg_lamb. 0 means no span reg."}
+    )
+
+    running_r2_mult: float = field(
+        default=1, metadata={"help": "running_r2_mult."}
+    )
+
+    A_reg_lamb: float = field(
+        default=0, metadata={"help": "A_reg_lamb. 0 means no A reg."}
+    )
+
+    span_reg_A_learning_rate: float = field(
+        default=1e-2, metadata={"help": "The initial learning rate for span_reg_A."}
+    )
+
+    adjust_grad_lamb: float = field(
+        default=0, metadata={"help": "adjust grad lamb."}
+    )
+
+    anti_gum: bool = field(
+        default=False,
+        metadata={"help": "use anti-gum"},
+    )
+
+    cpu_cos_sim: bool = field(
+        default=False,
+        metadata={"help": "cos sim stored on cpu"},
+    )
+    
+    mask_frozen: bool = field(
+        default=False,
+        metadata={"help": "mask_frozen and not trained"},
+    )
+
+    mask_span_reg_lamb: float = field(
+        default=0, metadata={"help": "adjust mask reg with span reg."}
+    )
+
+    opt_span_reg_only: bool = field(
+        default=False,
+        metadata={"help": "optimize only the As for span reg"},
+    )
+
+    adjust_grad_do_mult: bool = field(
+        default=False,
+        metadata={"help": "adjust_grad_do_mult"},
+    )
+    
+    adjust_mask_grad: bool = field(
+        default=False,
+        metadata={"help": "adjust_mask_grad"},
+    )
+
+    uniqueness_reg_mask: bool = field(
+        default=False,
+        metadata={"help": "uniqueness_reg_mask"},
+    )
+
+    running_cos_mult: float = field(
+        default=1, metadata={"help": "running_cos_mult."}
+    )
+
+    running_cos_method: float = field(
+        default=1, metadata={"help": "running_cos_method."}
+    )
+
+    track_eval_cos: bool = field(
+        default=False,
+        metadata={"help": "track_eval_cos"},
+    )
+
+    scale_pruned: bool = field(
+        default=False,
+        metadata={"help": "scale_pruned"},
+    )
+
+    scale_params_learning_rate: float = field(
+        default=1e-2, metadata={"help": "The learning rate for scaling params."}
+    )
+
+    scale_fc: bool = field(
+        default=False,
+        metadata={"help": "scale_fc"},
+    )
+
+    scale_proj: bool = field(
+        default=False,
+        metadata={"help": "scale_proj"},
+    )
+
+    train_only_bias_ln:bool = field(
+        default=False,
+        metadata={"help": "train only bias, ln params"},
+    )
+
     mask_scores_learning_rate: float = field(
         default=1e-2, metadata={"help": "The initial learning rate for mask_scores."}
+    )
+
+    sage_beta_meta: float = field(
+        default=.1, metadata={"help": "Sage Beta Meta."}
+    )
+
+    sage_beta_3: float = field(
+        default=.1, metadata={"help": "Sage Beta 3."}
+    )
+
+    sage_delta_T: int = field(
+        default=10, metadata={"help": "Sage Delta T."}
+    )
+
+    zero_pruned: bool = field(
+        default=False,
+        metadata={"help": "zero out pruned weights after warmup ends"},
     )
 
     dense_pruning_method: str = field(default="topK", metadata={"help": "Dense Layers pruning method."})
@@ -110,6 +228,7 @@ class SparseTrainingArguments:
         default=1.0,
         metadata={"help": "Initial value of the threshold (for scheduling)."},
     )
+
     final_threshold: float = field(
         default=0.5,
         metadata={"help": "Final value of the threshold (for scheduling)."},
@@ -135,6 +254,16 @@ class SparseTrainingArguments:
     final_ampere_temperature: float = field(
         default=20.0,
         metadata={"help": "Final value of the ampere temperature (for scheduling)."},
+    )
+
+    weight_regularization: str = field(
+        default="disabled",
+        metadata={"help": "Add regularization to the weight scores."},
+    )
+
+    weight_regularization_final_lambda: float = field(
+        default=0.0,
+        metadata={"help": "Regularization intensity (used in conjunction with `weight_regularization`)."},
     )
 
     regularization: str = field(
@@ -261,6 +390,8 @@ class SparseTrainingArguments:
         metadata={"help": "The quantization scheme configuration to use for QAT"},
     )
 
+    schedule_type: str = field(default="linear", metadata={"help": "LR Schedule type."})
+
     @classmethod
     def hybrid(cls, regularization_lambda):
         sparse_args = cls()
@@ -334,6 +465,9 @@ class ModelPatchingCoordinator:
             teacher.to(device)
             self.teacher = teacher
 
+            for n, p in teacher.named_parameters():
+                p.requires_grad = False
+
         return self.teacher
 
 
@@ -364,8 +498,10 @@ class ModelPatchingCoordinator:
         initial_warmup = sparse_args.initial_warmup
         final_warmup = sparse_args.final_warmup
         final_lambda = sparse_args.regularization_final_lambda
+        final_weight_lambda = sparse_args.weight_regularization_final_lambda
         initial_ampere_temperature = sparse_args.initial_ampere_temperature
         final_ampere_temperature = sparse_args.final_ampere_temperature
+
 
         if not training:
             step -= 1
@@ -406,15 +542,28 @@ class ModelPatchingCoordinator:
             mul_coeff = 0.0
             threshold = final_threshold
             ampere_temperature = final_ampere_temperature
-
-        regu_lambda = final_lambda * threshold / final_threshold
+        
+        # if sparse_args.dense_pruning_method == "topK":
+        if False:
+        # if True:
+            # regu_lambda = final_lambda *  (1-threshold)
+            # weight_regu_lambda = final_weight_lambda *  (1-threshold)
+            0/0
+        else:
+            regu_lambda = final_lambda * threshold / final_threshold
+            weight_regu_lambda = final_weight_lambda * threshold / final_threshold
+            # 0/0
+            # 0/0
+            # 0/0
 
         context_data = dict(
             threshold=threshold,
             regu_lambda=regu_lambda,
+            weight_regu_lambda=weight_regu_lambda,
             ampere_temperature = ampere_temperature,
             progress = 1.0 - mul_coeff
         )
+
 
         def interp(a,b, interpf):
             return a * interpf + (1.0 - interpf) * b
@@ -455,25 +604,34 @@ class ModelPatchingCoordinator:
         info = {}
 
         regul_modes = ["l1", "l0"]
-        if mode in regul_modes:
-            threshold = self.patcher_context.get_context_data("threshold")
+        # if mode in regul_modes:
+        #     threshold = self.patcher_context.get_context_data("threshold")
 
         for name, module in model.named_modules():
             module_regu = 0
             module_nnz_info = {"nnz":0, "numel":0}
             nummod = 1
+            # if isinstance(module, nn.Linear): print("found")
             if mode not in regul_modes:
-                if isinstance(module, nn.Linear):
-                    weight = module.weight
-                    module_nnz_info["nnz"] = (weight != 0).sum()
-                    module_nnz_info["numel"] = weight.numel()
+                # if isinstance(module, nn.Linear):
+                #     weight = module.weight
+                #     module_nnz_info["nnz"] = (weight != 0).sum()
+                #     module_nnz_info["numel"] = weight.numel()
+                # elif isinstance(module, MaskedLinear): # added - why wasn't this here before? sparsity only with regu?
+                #     module_nnz_info = module.get_sparsity_info()
+                #     nummod = 1
+                if isinstance(module, MaskedLinear): # added - why wasn't this here before? sparsity only with regu?
+                    if module.args.method != "disabled": 
+                        module_nnz_info = module.get_sparsity_info()
+                        nummod = 1
                 else:
                     continue
             elif isinstance(module, GenericLinearPruningContextModule):
                 module_regu = module.regularization(mode)
             elif isinstance(module, MaskedLinear):
-                module_nnz_info = module.get_sparsity_info()
-                nummod = 0
+                if module.args.method != "disabled":
+                    module_nnz_info = module.get_sparsity_info()
+                    nummod = 1
             elif hasattr(module, "regularization"):
                 module_regu = module.regularization()
                 if hasattr(module, "get_sparsity_info"):
@@ -485,6 +643,8 @@ class ModelPatchingCoordinator:
             exclude_att_dense = not hasattr(self.sparse_args, "attention_output_with_dense") or self.sparse_args.attention_output_with_dense
             key += "attention" if self.model_structure.is_attention(name, exclude_att_dense=exclude_att_dense) else "dense"
 
+            # print(name, key, module_nnz_info) # debug
+
             if key not in info:
                 info[key] = defaultdict(float)
 
@@ -495,11 +655,16 @@ class ModelPatchingCoordinator:
             for k,v in module_nnz_info.items():
                 key_info[k] += float(v)
 
+        # print(info) # debug
+        # print(info["attention"]) # debug
+
         if mode not in regul_modes:
             lamb = 0
+            weight_lamb = self.patcher_context.get_context_data("weight_regu_lambda")
             lambdas = {k: 0 for k in info.keys()}
         else:
             lamb = self.patcher_context.get_context_data("regu_lambda")
+            weight_lamb = self.patcher_context.get_context_data("weight_regu_lambda")
             lambdas = {}
             n = len(info)
             for k in info.keys():
@@ -545,10 +710,15 @@ class ModelPatchingCoordinator:
                 if k in value:
                     del value[k]
 
-        return info["total"]["regu_loss"], lamb, info
+        return info["total"]["regu_loss"], lamb, weight_lamb, info
 
     def distil_loss_combine(self, ce_loss, model_inputs, model_outputs):
         sparse_args = self.sparse_args
+
+        if "distil_topk_probs" in model_inputs:
+            return self.distil_loss_combine_topk(ce_loss, model_inputs, model_outputs)
+
+
         teacher = self.create_teacher()
 
         if teacher == None:
@@ -556,25 +726,98 @@ class ModelPatchingCoordinator:
 
         temperature = sparse_args.distil_temperature
 
-        teacher_inputs_ = model_inputs.copy()
-        if 'labels' in teacher_inputs_:
-            del teacher_inputs_['labels']
+        # teacher_inputs_ = model_inputs.copy()
+        # if 'labels' in teacher_inputs_:
+        #     del teacher_inputs_['labels']
+
+        # teacher_inputs = {}
+        # for k,v in teacher_inputs_.items():
+        #     teacher_inputs[k] = v.detach().clone()
+        
+        # print(5, "torch alloc", torch.cuda.memory_allocated(0), "torch alloc 1", torch.cuda.memory_allocated(1), "torch reserved", torch.cuda.memory_reserved(0))
+
 
         teacher_inputs = {}
-        for k,v in teacher_inputs_.items():
+        for k,v in model_inputs.items():
             teacher_inputs[k] = v.detach().clone()
+        if 'labels' in teacher_inputs:
+            del teacher_inputs['labels']
 
         with torch.no_grad():
             teacher_outputs = teacher(**teacher_inputs)
+            
+        # print(6, "torch alloc", torch.cuda.memory_allocated(0), "torch alloc 1", torch.cuda.memory_allocated(1), "torch reserved", torch.cuda.memory_reserved(0))
+
+
+        # if True:
+        #     topk_probs, topk_indices = torch.topk(teacher_outputs["logits"].detach(), k=20, dim=-1)
+        #     return self.distil_loss_combine_topk(ce_loss, model_inputs, model_outputs, probs=topk_probs, indices=topk_indices)
 
         loss_logits = 0
         for logit_name in self.logit_names:
             logits_stu = model_outputs[logit_name]
-            logits_tea = teacher_outputs[logit_name].detach().clone()
+            # logits_tea = teacher_outputs[logit_name].detach().clone()
+            logits_tea = teacher_outputs[logit_name].detach()
+            # del teacher_outputs
+            # del teacher_inputs
+            # del teacher
+            # torch.cuda.empty_cache()
+            
+            # print(7, "torch alloc", torch.cuda.memory_allocated(0), "torch alloc 1", torch.cuda.memory_allocated(1), "torch reserved", torch.cuda.memory_reserved(0))
+
+
+
+            loss_logits_part = nn_functional.kl_div(
+                # input=nn_functional.log_softmax(logits_stu / temperature, dim=-1),
+                # target=nn_functional.softmax(logits_tea / temperature, dim=-1),
+                # input=nn_functional.log_softmax(logits_stu.cpu() / temperature, dim=-1),
+                # target=nn_functional.softmax(logits_tea.cpu() / temperature, dim=-1),
+                input=nn_functional.log_softmax(logits_stu.to("cuda:1") / temperature, dim=-1),
+                target=nn_functional.softmax(logits_tea.to("cuda:1") / temperature, dim=-1),
+                reduction="batchmean",
+            ) * (temperature ** 2)
+
+            loss_logits = loss_logits + loss_logits_part
+
+        loss_logits = loss_logits / len(self.logit_names)
+
+        loss = sparse_args.distil_alpha_teacher * loss_logits.to(ce_loss.device) + sparse_args.distil_alpha_ce * ce_loss
+
+        return loss, loss_logits
+
+    def distil_loss_combine_topk(self, ce_loss, model_inputs, model_outputs, probs=None, indices=None):
+        sparse_args = self.sparse_args
+        if probs is None:
+            teacher_probs = model_inputs["distil_topk_probs"]
+        else:
+            teacher_probs = probs
+        if indices is None:
+            teacher_indices = model_inputs["distil_topk_indices"]
+        else:
+            teacher_indices = indices
+        
+        student_logits = model_outputs["logits"]
+
+        n_vocab = student_logits.shape[-1]
+        topk = teacher_indices.shape[-1]
+        missing_probs = (1.0 - teacher_probs.sum(dim=-1))   / (n_vocab - topk)
+
+        teacher_full_probs = torch.ones_like(student_logits) * missing_probs.unsqueeze(-1)
+        teacher_full_probs = teacher_full_probs.scatter(-1, teacher_indices, teacher_probs)
+
+
+        temperature = sparse_args.distil_temperature
+        if temperature != 1.0:
+            print("can only use temperature 1 for now")
+            0/0
+        loss_logits = 0
+        for logit_name in self.logit_names:  # temp code - will cause issues for datasets with multiple logit names
+            logits_stu = model_outputs[logit_name]
+            # logits_tea = teacher_full_probs
 
             loss_logits_part = nn_functional.kl_div(
                 input=nn_functional.log_softmax(logits_stu / temperature, dim=-1),
-                target=nn_functional.softmax(logits_tea / temperature, dim=-1),
+                target=teacher_full_probs,
                 reduction="batchmean",
             ) * (temperature ** 2)
 
@@ -587,23 +830,57 @@ class ModelPatchingCoordinator:
         return loss, loss_logits
 
 
-    def create_optimizer_groups(self, model, args, sparse_args):
+
+
+    def create_optimizer_groups(self, model, args, sparse_args, span_reg_params=[]):
         # Prepare optimizer and schedule (linear warmup and decay)
         no_decay = ["bias", "LayerNorm.weight", "NoNorm.weight", "layer_norm.weight", "layernorm_embedding.weight",
-                    "final_layer_norm.weight"]
+                    # "final_layer_norm.weight", "ln_1.weight", "ln_2.weight", "ln_f.weight"]
+                    "final_layer_norm.weight", "ln_1.weight", "ln_2.weight", "ln_f.weight", "span_reg_A", "span_reg_B"]
         mask_params = []
         no_decay_params = []
         decay_params = []
+        scale_params = []
+
+        opt_only_sparse_reg = False
+        if sparse_args.opt_span_reg_only:
+            print("optimizing only span reg")
+            opt_only_sparse_reg = True
 
         for n, p in model.named_parameters():
             if not p.requires_grad:
+                print("skip no grad", n)
                 continue
+            
+            no_decay_param = any(nd in n for nd in no_decay)
+            if sparse_args.train_only_bias_ln and not no_decay_param:
+                p.requires_grad = False
+                continue
+            
+            if "out_scale" in n:
+                print("out_scale param add", n, "lr", sparse_args.scale_params_learning_rate)
+                scale_params.append(p)
+                continue
+
+            if "span_reg" in n:
+                print("span reg param add", n)
+                span_reg_params.append(p)
+                continue
+
             if "mask_score" in n:
-                mask_params.append(p)
-            elif any(nd in n for nd in no_decay):
+                if sparse_args.mask_frozen:
+                    print("mask frozen, not optimizing mask")
+                    continue
+                if "sage" not in sparse_args.dense_pruning_method: # calculate manually for sage
+                    mask_params.append(p)
+            elif no_decay_param:
                 no_decay_params.append(p)
+            elif "span_reg" in n:
+                # span_reg_params.append(p)
+                0/0 # temp - moving this out of model!
             else:
                 decay_params.append(p)
+            print("optimizing", n)
 
         optimizer_grouped_parameters = [
             {
@@ -614,6 +891,16 @@ class ModelPatchingCoordinator:
                 "params": no_decay_params,
                 "lr": args.learning_rate,
                 "weight_decay": 0.0,
+            },
+            {
+                "params": span_reg_params,
+                "lr": sparse_args.span_reg_A_learning_rate,
+                "weight_decay": 0.0,
+            },
+            {
+                "params": scale_params,
+                "lr": sparse_args.scale_params_learning_rate,
+                "weight_decay": args.weight_decay,
             },
             {
                 "params": decay_params,
@@ -646,6 +933,7 @@ class ModelPatchingCoordinator:
         patcher_context = self.patcher_context
 
         if attention_pruning_method_parts[0] != "disabled" or sparse_args.ampere_pruning_method != "disabled":
+        # if True: # test no pruning mask
             args_attention = LinearPruningArgs(
                 method=attention_pruning_method_parts[0],
                 submethod=attention_pruning_method_parts[1],
@@ -654,6 +942,7 @@ class ModelPatchingCoordinator:
                 block_cols=sparse_args.attention_block_cols,
                 bias_mask=bias_mask,
                 min_elements=linear_min_parameters,
+                mask_frozen=sparse_args.mask_frozen,
             )
 
             args_attention_t = LinearPruningArgs(
@@ -664,6 +953,7 @@ class ModelPatchingCoordinator:
                 block_cols=sparse_args.attention_block_rows,
                 bias_mask=bias_mask,
                 min_elements=linear_min_parameters,
+                mask_frozen=sparse_args.mask_frozen,
             )
 
             if args_attention.submethod == "joint":
@@ -693,6 +983,15 @@ class ModelPatchingCoordinator:
                 block_cols=sparse_args.dense_block_cols,
                 bias_mask=bias_mask,
                 min_elements=linear_min_parameters,
+                sage_beta_meta=sparse_args.sage_beta_meta,
+                soft_temperature=sparse_args.soft_temperature,
+                adjust_grad_lamb=sparse_args.adjust_grad_lamb,
+                mask_span_reg_lamb=sparse_args.mask_span_reg_lamb,
+                scale_pruned=sparse_args.scale_pruned,
+                scale_fc=sparse_args.scale_fc,
+                scale_proj=sparse_args.scale_proj,
+                mask_init=InitDirective(kind=sparse_args.mask_init, scale=sparse_args.mask_scale),
+                mask_frozen=sparse_args.mask_frozen,
             )
             if args_dense.submethod.startswith("1d"):
                 p_dense = ChannelPruningModulePatcher(

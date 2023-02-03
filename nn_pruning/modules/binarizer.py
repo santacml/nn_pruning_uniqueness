@@ -69,6 +69,82 @@ class ThresholdBinarizer(autograd.Function):
     def backward(ctx, gradOutput):
         return gradOutput, None, None, None
 
+class GlobalTopKBinarizer(autograd.Function):
+    """
+    Threshold binarizer.
+    Computes a binary mask M from a real value matrix S such that `M_{i,j} = 1` if and only if `S_{i,j} > \tau`
+    where `\tau` is a real value threshold.
+
+    Implementation is inspired from:
+        https://github.com/arunmallya/piggyback
+        Piggyback: Adapting a Single Network to Multiple Tasks by Learning to Mask Weights
+        Arun Mallya, Dillon Davis, Svetlana Lazebnik
+    """
+
+    @staticmethod
+    def forward(ctx, inputs: torch.tensor, threshold: float, min_elements: float=0.005):
+        """
+        We limit by default the pruning so that at least 0.5% (half a percent) of the weights are remaining (min_elements)
+        If you set min_elements to zero, no minimal number of elements will be enforced.
+        Args:
+            inputs (`torch.FloatTensor`)
+                The input matrix from which the binarizer computes the binary mask.
+            threshold (`float`)
+                The threshold value (in R).
+            sigmoid (`bool`)
+                If set to ``True``, we apply the sigmoid function to the `inputs` matrix before comparing to `threshold`.
+                In this case, `threshold` should be a value between 0 and 1.
+        Returns:
+            mask (`torch.FloatTensor`)
+                Binary matrix of the same size as `inputs` acting as a mask (1 - the associated weight is
+                retained, 0 - the associated weight is pruned).
+        """
+        nb_elems = inputs.numel()
+        if min_elements != 0:
+            nb_min = int(min_elements * nb_elems) + 1
+        else:
+            nb_min = 0
+        mask = (inputs >= threshold).type(inputs.type())
+        if mask.sum() < nb_min:
+            k_threshold = inputs.flatten().kthvalue(max(nb_elems - nb_min, 1)).values
+            mask = (inputs > k_threshold).type(inputs.type())
+        return mask
+
+    @staticmethod
+    def backward(ctx, gradOutput):
+        return gradOutput, None, None, None
+
+
+
+class SageBinarizer(autograd.Function):
+    """
+    """
+
+    @staticmethod
+    def forward(ctx, ipt: torch.tensor, exp_avg_unc: torch.tensor, exp_avg_ipt: torch.tensor, threshold: float, beta_meta: float):
+        if beta_meta > 0 and beta_meta<1:
+            mask = exp_avg_ipt * exp_avg_unc 
+        elif beta_meta == 1.:
+            mask = exp_avg_ipt
+        elif beta_meta == 2.:
+            mask = exp_avg_ipt * exp_avg_unc.sqrt()
+        else:
+            mask = exp_avg_ipt * (ipt - exp_avg_ipt).abs()
+
+        mask = mask.clone()
+        _, idx = mask.flatten().sort(descending=True)
+        j = int(threshold * mask.numel())
+
+        # flat_out and mask access the same memory.
+        flat_out = mask.flatten()
+        flat_out[idx[j:]] = 0
+        flat_out[idx[:j]] = 1
+        return mask
+
+    @staticmethod
+    def backward(ctx, gradOutput):
+        return gradOutput, None, None, None, None
+
 
 class TopKBinarizer(autograd.Function):
     """
@@ -112,6 +188,7 @@ class TopKBinarizer(autograd.Function):
         return gradOutput, None
 
 
+
 class MagnitudeBinarizer(object):
     """
     Magnitude Binarizer.
@@ -146,3 +223,33 @@ class MagnitudeBinarizer(object):
         flat_out[idx[j:]] = 0
         flat_out[idx[:j]] = 1
         return mask
+
+
+class GroupMagnitudeBinarizer(object):
+
+    @staticmethod
+    def apply(inputs: torch.tensor, threshold: float):
+
+        # Get the subnetwork by sorting the inputs and using the top threshold %
+        mask = inputs.clone()
+
+        if inputs.shape[0] >  inputs.shape[1]:  # naively assume this is 1d alt - just want a quick implementation here
+            inputs_normed = inputs.norm(dim=1)
+        else:
+            inputs_normed = inputs.norm(dim=0)
+
+        _, idx = inputs_normed.abs().flatten().sort(descending=True)
+        j = int(threshold * inputs_normed.numel())
+
+        # flat_out and mask access the same memory.
+        if inputs.shape[0] >  inputs.shape[1]:
+            mask[idx[j:], :] = 0
+            mask[idx[:j], :] = 1
+        else:
+            mask[:, idx[j:]] = 0
+            mask[:, idx[:j]] = 1
+
+        # print(threshold, mask.sum() / mask.numel(), idx.shape, inputs.shape, inputs_normed.shape )
+        # if threshold < 1: print(mask)
+        return mask
+

@@ -234,11 +234,13 @@ class InferenceModelPatcher(ModelPatcher):
 
         super().patch(model)
 
-def optimize_model(model, mode, clone=True):
+def optimize_model(model, mode, clone=True, keep_dim_mode="default"):
     """mode in ["dense", "heads", "block_sparse"]"""
     import copy
 
     assert mode != "disabled"
+    assert keep_dim_mode in ["1d_alt", "1d", "uniqueness", "default"]
+
     if clone == True:
         model = copy.deepcopy(model)
 
@@ -261,20 +263,42 @@ def optimize_model(model, mode, clone=True):
                         params[name][:, output_mask] = 0
 
     # Create a model patcher
-    mp = InferenceModelPatcher(prune_heads=True, mode=mode)
+    mp = InferenceModelPatcher(prune_heads=False, mode=mode)
     pattern_prefix = model_structure.PATTERN_PREFIX
     for i, pattern in enumerate(model_structure.FFN_LAYERS):
         pattern_name = (pattern_prefix + model_structure.LAYER_PATTERNS[pattern]).replace(".", "\\.")
         if i == 0:
-            mp.add_pattern(
-                pattern_name,
-                {"input_keep_dimension": True, "output_keep_dimension": False, "prune_input":False, "prune_output":True},
-            )
+            if keep_dim_mode == "1d_alt":
+                mp.add_pattern(
+                    pattern_name,
+                    {"input_keep_dimension": True, "output_keep_dimension": False, "prune_input":False, "prune_output":True},
+                )
+            elif keep_dim_mode == "uniqueness":
+                mp.add_pattern(
+                    pattern_name,
+                    {"input_keep_dimension": True, "output_keep_dimension": True, "prune_input":False, "prune_output":True},
+                )
+            else: # 1d or default
+                mp.add_pattern(
+                    pattern_name,
+                    {"input_keep_dimension": True, "output_keep_dimension": True, "prune_input":True, "prune_output":True},
+                )
         else:
-            mp.add_pattern(
-                pattern_name,
-                {"output_keep_dimension": True, "input_keep_dimension": False, "prune_input":True, "prune_output":False},
-            )
+            if keep_dim_mode == "1d_alt":
+                mp.add_pattern(
+                    pattern_name,
+                    {"output_keep_dimension": True, "input_keep_dimension": False, "prune_input":True, "prune_output":False},
+                )
+            elif keep_dim_mode == "uniqueness":
+                mp.add_pattern(
+                    pattern_name,
+                    {"output_keep_dimension": True, "input_keep_dimension": True, "prune_input":False, "prune_output":True},
+                )
+            else: # 1d or default
+                mp.add_pattern(
+                    pattern_name,
+                    {"output_keep_dimension": True, "input_keep_dimension": True, "prune_input":True, "prune_output":True},
+                )
 
     mp.patch_model(model)
 

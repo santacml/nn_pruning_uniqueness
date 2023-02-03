@@ -18,11 +18,13 @@ Sparse Fine-tuning the library models for question answering.
 # You can also adapt this script on your own question answering task. Pointers for this are left as comments.
 
 from typing import Dict
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
+from transformers.optimization import AdamW, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_with_hard_restarts_schedule_with_warmup
 from .patch_coordinator import ModelPatchingCoordinator
 from collections import defaultdict
 import torch.cuda
 import torch.nn as nn
+
+from nn_pruning.modules.masked_nn import SageLinearPruningContextModule, MaskedLinear
 
 class TimingModule(nn.Module):
     def __init__(self, model, repeat=1, method_list=None):
@@ -73,7 +75,12 @@ class SparseTrainer:
 
         if self.loss_counter != 0:
             for k, v in self.metrics.items():
-                logs[k] = float(v) / self.loss_counter
+                if "max" in k or "min" in k:
+                    logs[k] = float(v)
+                else:
+                    # print(k, v, self.loss_counter)
+                    logs[k] = float(v) / self.loss_counter
+
 
             self.loss_counter = 0
             self.metrics = defaultdict(float)
@@ -84,11 +91,24 @@ class SparseTrainer:
         step = self.state.global_step
         self.patch_coordinator.schedule_threshold(step, self.state.max_steps, self.args.warmup_steps, training)
 
-    def training_step(self, *args, **kwargs):
+    # def training_step(self, *args, **kwargs):
+    #     self.schedule_threshold(True)
+    #     self.log_prefix = ""
+        # return super().training_step(*args, **kwargs)
+
+        
+    def training_step(self, model, inputs):
         self.schedule_threshold(True)
         self.log_prefix = ""
-        return super().training_step(*args, **kwargs)
+        results = super().training_step( model, inputs)
 
+        # self.update_sage(model)
+
+        # if self.sparse_args.zero_pruned and self.state.global_step > self.args.warmup_steps:
+        #     self.zero_pruned_weights(model)
+
+        return results
+        
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
@@ -108,7 +128,7 @@ class SparseTrainer:
         self.metrics["ce_loss"] += float(loss)
         loss, distil_loss = self.patch_coordinator.distil_loss_combine(loss, inputs, outputs)
         self.metrics["distil_loss"] += float(distil_loss)
-        regu_loss, lamb, info = self.patch_coordinator.regularization_loss(model)
+        regu_loss, lamb, weight_lamb, info = self.patch_coordinator.regularization_loss(model)
 
         for kind, values in info.items():
             if kind == "total":
@@ -126,10 +146,28 @@ class SparseTrainer:
         return (loss, outputs) if return_outputs else loss
 
     def evaluate(self, *args, **kwargs):
+        # ABSOLUTELY ensure that there are no logs from training to taint these stats
+        # will affect stats if epoch doesn't divide into training logs evenly
+        self.pre_evaluate()
+        self.loss_counter = 0
+        self.metrics = defaultdict(float)
+
+        orig_ls = self.model.label_smoothing
+        self.model.label_smoothing = 0
+
         self.schedule_threshold(False)
-        self.log_prefix = "eval_"
+        # self.log_prefix = "eval_"
+        self.log_prefix = "eval/"
         ret = super().evaluate(*args, **kwargs)
+        self.model.label_smoothing = orig_ls
+        self.post_evaluate()
         return ret
+
+    def pre_evaluate(self):
+        pass
+
+    def post_evaluate(self):
+        pass
 
     def create_optimizer_and_scheduler(self, num_training_steps: int):
         assert self.optimizer is None
@@ -144,12 +182,30 @@ class SparseTrainer:
         optimizer_grouped_parameters = self.patch_coordinator.create_optimizer_groups(model, self.args, self.sparse_args)
 
         optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+        
         return optimizer
 
     def create_scheduler(self, num_training_steps: int):
-        scheduler = get_linear_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=self.args.warmup_steps,
-            num_training_steps=num_training_steps,
-        )
+        if self.sparse_args.schedule_type not in ["linear", "constant", "cos"]:
+            raise RuntimeError("Schedule not recognized")
+        
+        if self.sparse_args.schedule_type == "linear":
+            scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.args.warmup_steps,
+                num_training_steps=num_training_steps,
+            )
+        elif self.sparse_args.schedule_type == "constant":
+            scheduler = get_constant_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.args.warmup_steps,
+            )
+        elif self.sparse_args.schedule_type == "cos":
+            scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.args.warmup_steps,
+                num_training_steps=num_training_steps,
+                num_cycles=5,
+            )
+        
         return scheduler

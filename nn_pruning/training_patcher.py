@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from .model_patcher import ModelPatcher
 from nn_pruning.model_structure import BertStructure, ModelStructure
+from transformers.modeling_utils import Conv1D 
 
 class PatcherContextModule(nn.Module):
     pass
@@ -105,7 +106,7 @@ class ModelDispatchingPatcher(ModelPatcher):
             return patch_info["patcher"].patch_and_connect(child_module_name, child_module)
 
     def is_patchable(self, module_name, module, raiseError):
-        return isinstance(module, nn.Linear)
+        return isinstance(module, nn.Linear) or isinstance(module, Conv1D)
 
 
 class LinearModelPatcher(ModelDispatchingPatcher):

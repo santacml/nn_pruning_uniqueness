@@ -1,3 +1,7 @@
+output/
+*.df
+results_graphing/dfs/*
+
 # Compiled python modules.
 *.pyc
 *.pyo
@@ -24,3 +28,5 @@ wandb
 
 # backup directories
 back
+
+eval/*

@@ -1,6 +1,9 @@
 from typing import Dict
 import re
-from transformers import BertConfig, BartConfig, T5Config
+from transformers import BertConfig, BartConfig, T5Config, GPT2Config
+from transformers.models.gpt_neo.configuration_gpt_neo import GPTNeoConfig
+
+# originally from https://github.com/huggingface/nn_pruning
 
 class ModelStructure:
     PATTERN_PREFIX: str = ""
@@ -126,16 +129,81 @@ class T5Structure(ModelStructure):
         attention_head_size="key_value_proj_dim",
     )
 
+
+
+# transformer.h.9
+# transformer.h.9.ln_1
+# transformer.h.9.attn
+# transformer.h.9.attn.attention
+# transformer.h.9.attn.attention.attn_dropout
+# transformer.h.9.attn.attention.resid_dropout
+# transformer.h.9.attn.attention.k_proj
+# transformer.h.9.attn.attention.v_proj
+# transformer.h.9.attn.attention.q_proj
+# transformer.h.9.attn.attention.out_proj
+# transformer.h.9.ln_2
+# transformer.h.9.mlp
+# transformer.h.9.mlp.c_fc
+# transformer.h.9.mlp.c_proj
+# transformer.h.9.mlp.dropout
+# transformer.h.10
+
+
+class GPTNeoStructure(ModelStructure):
+    PATTERN_PREFIX = "transformer.h.[0-9]+."
+    LAYER_PATTERNS = dict(
+        query="attn.attention.q_proj",
+        key="attn.attention.k_proj",
+        value="attn.attention.v_proj",
+        att_dense="attn.attention.out_proj",
+        interm_dense="mlp.c_fc",
+        output_dense="mlp.c_proj",
+    )
+    ATTENTION_PREFIX = ("attn")
+    ATTENTION_LAYERS = ("query", "key", "value")
+    # MHA_LAYERS = ATTENTION_LAYERS + ("att_dense","interm_dense","output_dense",)
+    MHA_LAYERS = ATTENTION_LAYERS + ("att_dense", )
+    NAME_CONFIG = dict(
+        hidden_size="hidden_size",
+        intermediate_size="intermediate_size",
+        num_hidden_layers="num_hidden_layers",
+        num_attention_heads="num_attention_heads",
+        attention_head_size="attention_head_size",
+    )
+
+class GPT2Structure(ModelStructure):
+    PATTERN_PREFIX = "transformer.h.[0-9]+."
+    LAYER_PATTERNS = dict(
+        att_dense="attn.c_proj",
+        interm_dense="mlp.c_fc",
+        output_dense="mlp.c_proj",
+    )
+    ATTENTION_PREFIX = ()
+    ATTENTION_LAYERS = ()
+    # MHA_LAYERS = ATTENTION_LAYERS + ("att_dense","interm_dense","output_dense",)
+    MHA_LAYERS = ATTENTION_LAYERS + ("att_dense",)
+    NAME_CONFIG = dict(
+        hidden_size="hidden_size",
+        intermediate_size="intermediate_size",
+        num_hidden_layers="num_hidden_layers",
+        num_attention_heads="num_attention_heads",
+        attention_head_size="attention_head_size",
+    )
+
 config2struct = {
     BertConfig: BertStructure,
     BartConfig: BartStructure,
     T5Config: T5Structure,
+    GPTNeoConfig: GPTNeoStructure,
+    GPT2Config: GPT2Structure,
 }
 
 name2struct = {
     "bert": BertStructure,
     "bart": BartStructure,
     "t5": T5Structure,
+    "gpt_neo": GPTNeoStructure,
+    "gpt2": GPT2Structure
 }
 
 class ModelStructureNotFound(RuntimeError):
@@ -143,13 +211,17 @@ class ModelStructureNotFound(RuntimeError):
 
 def struct_from_config(config):
     structure = None
-    if hasattr(config, "config_class"):
+    
+    if config in config2struct:
+        structure = config2struct.get(config)
+    elif hasattr(config, "config_class"):
         structure = config2struct.get(config.config_class)
     elif hasattr(config, "model_type"):
         structure = name2struct.get(config.model_type)
 
     if structure is None:
         raise ModelStructureNotFound(f"Model config does not match any of the defined structures.")
+
     return structure
 
 def struct_from_name(model_name):
